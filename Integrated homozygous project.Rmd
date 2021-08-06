@@ -1,0 +1,209 @@
+in---
+title: "Integrated homozygous project"
+output: html_notebook
+---
+```{r}
+#This project requires 4 plugins, which can be installed with this code:
+install.packages("odbc")
+install.packages("DBI")
+install.packages("tidyverse")
+install.packages("Rcpp")
+install.packages("openxlsx")
+```
+
+```{r}
+#Loading libraries. After the packages above are installed, they need to be loaded. They only need to be installed on a computer once, but they need to be loaded every time RStudio is opened.
+#The memory.limit function was required on the computer I used to increase the memory size so that large tables could be loaded. It may not be needed in all cases.
+library(odbc)
+library(DBI)
+library(tidyverse)
+library(openxlsx)
+memory.limit(size=56000)
+```
+
+```{r}
+#This code connects to the HistoTrac database. The computer RStudio is running on needs to have access to HistoTrac, and the settings for your particular HistoTrac configuration may be different.
+
+# Connecting to the HistoTrac database
+con <- dbConnect(odbc::odbc(), "Histotrac", timeout = 10)
+
+#Pulling a list of available tables in HistoTrac and adding it to "HTtableList"
+(HTtableList <- dbListTables(con) %>% as_tibble)
+
+#This will show all of the tables in the HistoTrac database. Not all of them are used, and only a few are required to search for homozygous patients.
+```
+#The following code chunks will extract each of the necessary tables from HistoTrac, load them into R in the computer's memory, and then write them to a csv file in the active directory.
+```{r}
+#Extract and save Sample table. Use as a template for extracting and saving tables; just change the table names in the second and third lines of code. This uses the direct extraction code. If this doesn't work, use the error-correcting code based on the "Patient" table.
+con <- dbConnect(odbc::odbc(), "HistoTrac", timeout = 10)
+(dtSample <- dbReadTable(con, "Sample") %>% as_tibble)
+#The code below saves the table in "rds" format, an R format that preserves the table structure, and results in smaller files than "csv.gz." The only limitation is the rds file can only be opened in R. If for some reason you need to read the files by another system, use the second line of code (remove the "#") to save it as a csv.gz file.
+saveRDS(dtSample, file = "Sample.rds")
+#dtSample %>% write_csv("Sample.csv.gz")
+```
+
+```{r}
+#Extract and save Patient table. The Patient table was difficult to get out, so error-correcting code was used.  
+#This uses the error-correcting code for tables that do not extract easily. Only the last two lines have to be changed to extract and save different tables.
+con <- dbConnect(odbc::odbc(), "HistoTrac", timeout = 10)
+testpull <- function(con, tbnm, rownumber, ls_colnm, sp, ep) {
+  re <- tryCatch({
+    # try to query database based on given start point and end point of column
+    dt <- dbGetQuery(con, paste("SELECT TOP", rownumber, paste0(ls_colnm[sp:ep], collapse = ', '), "FROM", tbnm))
+    return(dt)
+  },
+  error = function(error_message) {
+    return("error")
+  },
+  warning = function(warning_message) {
+    return("warning")
+  }
+  )
+}
+pull <- function(con, tbnm) {
+  # get total row number based on table name
+  rownumber <- dbGetQuery(con, paste("SELECT count(*) FROM", tbnm))[[1]]
+  # get all column names of the table
+  ls_colnm <- c(dbGetQuery(con, paste("SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME='",tbnm,"'",sep=""))$COLUMN_NAME)
+  # set up variables for iteration
+  colnumber <- length(ls_colnm)
+  mincolnbr <- 1
+  maxcolnbr <- colnumber
+  sp <- mincolnbr
+  ep <- maxcolnbr
+  # initiate an empty dataframe
+  df_total <- setNames(data.frame(matrix(nrow=rownumber, ncol=1)),c("x"))
+  
+  while (dim(df_total)[2] < maxcolnbr) {
+    #print(c(sp,ep))
+    df_test <- testpull(con, tbnm, rownumber, ls_colnm, sp, ep)
+    #print(typeof(df_test))
+    if (typeof(df_test) == "list") {
+      # save successfully pulled data
+      if (c(colnames(df_total))[1] == "x") {
+        df_total <- subset(cbind(df_total, df_test),select=-c(x))
+      }
+      else {
+        df_total <- cbind(df_total, df_test)
+      }
+      if (dim(df_total)[2] < maxcolnbr) {
+        # adjust both start and end points when testpull succeeded
+        sp <- ep + 1
+        ep <- maxcolnbr
+        #print(c(sp, ep))
+      }
+    }
+    else {
+      dbDisconnect(con)
+      con <- dbConnect(odbc::odbc(), "HistoTrac", timeout = 10)
+      # adjust end point when testpull failed
+      ep <- floor(sp-1+((ep-(sp-1))/2))
+      #print(c(sp, ep))
+    }
+  }
+  return(df_total)
+}
+
+(dtPatient <- pull(con, "Patient") %>% as_tibble)
+saveRDS(dtPatient, file = "Patient.rds")
+#dtPatient %>% write_csv("Patient.csv.gz")
+```
+
+```{r}
+#save SampleLocation table
+con <- dbConnect(odbc::odbc(), "HistoTrac", timeout = 10)
+(dtSampleLocation <- dbReadTable(con, "SampleLocation") %>% as_tibble)
+#dtSampleLocation %>% write_csv("SampleLocation.csv.gz")
+saveRDS(dtSampleLocation, file = "SampleLocation.rds")
+```
+
+```{r}
+#save Location table
+con <- dbConnect(odbc::odbc(), "HistoTrac", timeout = 10)
+(dtLocation <- dbReadTable(con, "Location") %>% as_tibble)
+#dtLocation %>% write_csv("Location.csv.gz")
+saveRDS(dtLocation, file = "Location.rds")
+```
+#Now a copy of the necessary HistoTrac tables are saved as rds files. The next section loads these back into R, and manipulates the data to find homozygous patients. You can start here if you have the tables saved, and don't need to interface with HistoTrac.
+```{r}
+# This pulls in the Patient, Sample, SampleLocation, and Location tables from HistoTrac. This looks for files in the working folder (set in RStudio, and usually wherever you have the rmd file saved). The mutate function ensures all blank or missing values are recorded as "NA" by R, which will be useful for wrangling the data.
+(total_patient_table <- readRDS(file = "Patient.rds") %>% mutate(across(where(is.character), ~na_if(., ""))))
+(total_sample_table <- readRDS(file = "Sample.rds") %>% mutate(across(where(is.character), ~na_if(., ""))))
+(total_samplelocation_table <- readRDS(file = "SampleLocation.rds")%>% mutate(across(where(is.character), ~na_if(., ""))))
+(total_location_table <- readRDS(file = "Location.rds")%>% mutate(across(where(is.character), ~na_if(., ""))))
+```
+
+```{r}
+#This code filters all low-res typing fields (the second field) that is empty (except for DPB1, there is no lo-res DP typing). It then filters for patients with typing results at each locus. 
+(homozygous <- filter(total_patient_table,
+              is.na(A2Cd),
+              is.na(B2Cd),
+              is.na(Cw2Cd),
+              is.na(DR2Cd),
+              is.na(dq2cd),
+              is.na(mDPB12cd),
+              !is.na(A1Cd),
+              !is.na(B1Cd),
+              !is.na(Cw1Cd),
+              !is.na(DR1Cd),
+              !is.na(dq1cd),
+              !is.na(mDPB11cd),
+              !is.na(HospitalID),
+              ))
+```
+
+```{r}
+#This selects certain columns in the homozygous table and puts them in a new table called "simple_homozygous."
+(simple_homozygous <- (select(homozygous, PatientId, HospitalID, RaceCd, A1Cd, B1Cd, mC1Cd, DR1Cd, drw1cd, mDQB11cd, mDQA11Cd, mDPB11cd, mDPA11Cd)))
+```
+
+```{r}
+#This links the homozygous patients from the patient table to the sample table. It then filters for only blood, cell, or buccal swab samples. It then simplifies the table by only keeping the SampleID, SampleNbr, and SpecimenTypeCd from the sample table.
+(homozygous_samples <- left_join(simple_homozygous, total_sample_table, by = "PatientId") %>% 
+   filter(
+  SpecimenTypeCd == "Blood" 
+  | 
+  SpecimenTypeCd == "Cells"
+  |
+  SpecimenTypeCd == "Buccal Swab"
+  ) 
+  %>%select(PatientId:SampleID, SampleNbr, SpecimenTypeCd))
+```
+
+```{r}
+#This links the homozygous_samples table to the SampleLocation table
+#Location ID links to the Location table to give the box name
+#RowNbr and ColNbr are the location of the tube in the box. RowNbr is in numbers corresponding to letters (1=A, 2=B, etc.)
+(simple_homozygous_samples <- left_join(homozygous_samples, total_samplelocation_table, by = "SampleID") 
+#This links to Location table to get box names. I had to use a character vector (c("a" = "b")) to link them since the table names were not exactly the same in the two tables (LocationID versus LocationId)
+%>% left_join( total_location_table, c("LocationID" = "LocationId")) 
+#This filters for any samples that don't have a location, meaning we don't have samples in the lab.
+%>% filter(!is.na(LocationID)) 
+#The select function can be used to reorder columns as well, depending on the order you put the column names into the function
+%>% select(HospitalID:mDPA11Cd, SampleNbr, SpecimenTypeCd, LocationNm, RowNbr.x, ColNbr.x) 
+#This mutates the row numbers to row letters
+%>% mutate(RowNbr.x = as.integer(RowNbr.x))
+%>% mutate(RowNbr.x = LETTERS[RowNbr.x]) 
+#Select columns for final usable table
+%>% select(HospitalID:mDPA11Cd, SampleNbr, SpecimenTypeCd, LocationNm, RowNbr.x, ColNbr.x) 
+#Remove duplicate entries by patient. 
+%>% distinct(HospitalID, .keep_all = TRUE)
+  )
+```
+
+```{r}
+#This removes all homozygous patients that encode the 3 most frequent European haplotypes, if you want to only submit rarer haplotypes.
+(Common_WHI_haplotypes_filtered <- simple_homozygous_samples 
+  %>% filter (A1Cd != "1",B1Cd != "8",DR1Cd != "17") 
+  %>% filter (A1Cd != "3",B1Cd != "7",DR1Cd != "15")
+  %>% filter(A1Cd != "2",B1Cd != "44",DR1Cd != "4")  
+  )
+```
+```{r}
+#There you go, you have a list of homozygous individuals for which samples exist. You can save these tables to files, either csv or Excel, by removing the "#" from the lines below. 
+
+#write_excel_csv(simple_homozygous_samples, "Homozygous samples.txt")
+#write.xlsx(simple_homozygous_samples, file = "Homozygous samples.xlsx")
+#write_excel_csv(Common_WHI_haplotypes_filtered, "Filtered homozygous samples.txt")
+write.xlsx(Common_WHI_haplotypes_filtered, file = "Filtered homozygous samples.xlsx")
+```
